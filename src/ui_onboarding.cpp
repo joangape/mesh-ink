@@ -8,6 +8,7 @@
 #include "hardware/performance.h"
 #include "hardware/buttons.h"
 #include "hardware/board.h"
+#include "hardware/wireless.h"
 #include <esp_heap_caps.h>
 #include <time.h>
 #include <freertos/FreeRTOS.h>
@@ -372,7 +373,7 @@ enum class Screen : uint8_t {
     Channels, ChannelChat, ChannelManage, ChannelCreate, ChannelDelete,
     Maps, Discovery, More, Diagnostics,
     Settings, ProtocolSelect, ProtocolSettings, BackupOptions, BackupFiles, BackupConfirm, BackupProgress, BackupResult,
-    GpsSettings, GpsTuning, LocationSharing, DateTime, ManualTime, Timezone, CustomTimezone, DisplaySettings, NightSchedule, Help, About
+    GpsSettings, GpsTuning, LocationSharing, DateTime, ManualTime, Timezone, CustomTimezone, DisplaySettings, NightSchedule, Help, About, DeviceInfo
 };
 static Screen screen = Screen::Welcome;
 static Screen backup_return_screen=Screen::More;
@@ -409,6 +410,7 @@ static uint8_t retained_wake_tab=0;
 static bool retained_wake_tab_valid=false;
 static Screen preset_return_screen = Screen::Welcome;
 static uint8_t preset_page = 3;
+static uint8_t device_info_page = 0;
 static bool details_from_discovery=false;
 static uint8_t details_page=0;
 
@@ -3448,7 +3450,7 @@ static void draw_contact_details() {
     }
 }
 
-static void settings_row(const char* title,const char* subtitle,int y);
+static void settings_row(const char* title,const char* subtitle,int reference_y,int reference_h=112);
 
 static void draw_discovery() {
     draw_app_header("DISCOVERED",true);
@@ -3467,10 +3469,10 @@ static void draw_discovery() {
     draw_list_page_footer(discovery_page,count);
 }
 
-enum class MoreAction:uint8_t{Settings,Discovery,Backup,Companion,Diagnostics,Help};
+enum class MoreAction:uint8_t{Settings,Discovery,Backup,Companion,Diagnostics,DeviceInfo,Help};
 struct MoreMenuItem{const char* title;const char* subtitle;MoreAction action;};
 
-static size_t more_menu_items(MoreMenuItem out[6]){
+static size_t more_menu_items(MoreMenuItem out[7]){
     size_t count=0;
     out[count++]={"SETTINGS","Device and protocol configuration",MoreAction::Settings};
     if(mesh_protocol_has(MESHINK_PROTOCOL_CAP_DISCOVERY))
@@ -3480,18 +3482,24 @@ static size_t more_menu_items(MoreMenuItem out[6]){
         out[count++]={"BLUETOOTH COMPANION","Restart in protocol companion mode",MoreAction::Companion};
     if(mesh_protocol_has(MESHINK_PROTOCOL_CAP_DIAGNOSTICS))
         out[count++]={"DIAGNOSTICS","Live protocol and radio stats",MoreAction::Diagnostics};
+    out[count++]={"DEVICE INFO","Battery, IDs and device status",MoreAction::DeviceInfo};
     out[count++]={"HELP","Using MeshInk",MoreAction::Help};
     return count;
 }
 
-static int more_row_y(size_t index){return 130+(int)index*130;}
+// Seven rows no longer fit above the tab bar at the normal 130px pitch, so
+// the list switches to a tighter pitch/height when every row is present.
+static int more_row_y(size_t index,size_t count){
+    return count>6?118+(int)index*108:130+(int)index*130;
+}
+static int more_row_h(size_t count){return count>6?100:112;}
 
 static void draw_more() {
     draw_app_header("MORE");
-    MoreMenuItem items[6]{};
+    MoreMenuItem items[7]{};
     const size_t count=more_menu_items(items);
     for(size_t i=0;i<count;++i)
-        settings_row(items[i].title,items[i].subtitle,more_row_y(i));
+        settings_row(items[i].title,items[i].subtitle,more_row_y(i,count),more_row_h(count));
     draw_bottom_nav(3);
 }
 
@@ -3516,9 +3524,9 @@ static void draw_diagnostics() {
     ui_action_button(label,action,true);
 }
 
-static void settings_row(const char* title,const char* subtitle,int reference_y) {
+static void settings_row(const char* title,const char* subtitle,int reference_y,int reference_h) {
     const MeshInkUiLayout& layout=portrait_layout();
-    const MeshInkUiRect row=meshink_outer_row_rect(layout,reference_y,112);
+    const MeshInkUiRect row=meshink_outer_row_rect(layout,reference_y,reference_h);
     ui_section_card(row);
     ui_text_fit(title,layout.content_text_x,row.y+ui_h(13),
                 row.width-ui_w(76),3,0,true);
@@ -4552,6 +4560,108 @@ static void draw_about() {
                 info.y+ui_h(74),info.x+info.width-ui_x(170)-ui_w(16),2,0,false);
 }
 
+// Read-only snapshot of device state. Everything is read at draw time, so
+// reopening the page (or any redraw) shows current values.
+static void device_info_line(const MeshInkUiRect& card,int line,const char* label,const char* value) {
+    const MeshInkUiLayout& layout=portrait_layout();
+    const int y=card.y+ui_h(52+line*34);
+    ui_text(label,layout.content_text_x,y,2,0,true);
+    ui_text_fit(value,ui_x(190),y,card.x+card.width-ui_x(190)-ui_w(16),2,0,false);
+}
+static void draw_device_info() {
+    draw_app_header("DEVICE INFO",true);
+    const MeshInkUiLayout& layout=portrait_layout();
+    char buf[64]{};
+    constexpr uint8_t pages=2;
+    if(device_info_page>=pages)device_info_page=0;
+    if(device_info_page==0){
+
+    const MeshInkUiRect dev=meshink_outer_row_rect(layout,110,232);
+    ui_section_card(dev);
+    ui_text("DEVICE",layout.content_text_x,dev.y+ui_h(13),3,0,true);
+    device_info_line(dev,0,"FIRMWARE",UI_VERSION);
+    snprintf(buf,sizeof(buf),"%s rev %u",ESP.getChipModel(),(unsigned)ESP.getChipRevision());
+    device_info_line(dev,1,"CHIP",buf);
+    // The factory-programmed eFuse MAC is the chip's unique serial number.
+    const uint64_t mac=ESP.getEfuseMac();
+    snprintf(buf,sizeof(buf),"%012llX",(unsigned long long)(mac&0xFFFFFFFFFFFFULL));
+    device_info_line(dev,2,"SERIAL",buf);
+    snprintf(buf,sizeof(buf),"%lu MB",(unsigned long)(ESP.getFlashChipSize()/(1024UL*1024UL)));
+    device_info_line(dev,3,"FLASH",buf);
+    snprintf(buf,sizeof(buf),"%lu MB",(unsigned long)(ESP.getPsramSize()/(1024UL*1024UL)));
+    device_info_line(dev,4,"PSRAM",buf);
+
+    const MeshInkUiRect st=meshink_outer_row_rect(layout,352,300);
+    ui_section_card(st);
+    ui_text("STATUS",layout.content_text_x,st.y+ui_h(13),3,0,true);
+    snprintf(buf,sizeof(buf),"%s %s",mesh_protocol_core_name(),mesh_protocol_core_version());
+    device_info_line(st,0,"CORE",buf);
+    char id_long[40]{},id_short[5]{};
+    const char* id_name=node_name;
+    if(mesh_protocol_read_identity(id_long,sizeof(id_long),id_short,sizeof(id_short))&&id_long[0])id_name=id_long;
+    if(id_short[0])snprintf(buf,sizeof(buf),"%s (%s)",id_name[0]?id_name:"---",id_short);
+    else snprintf(buf,sizeof(buf),"%s",id_name[0]?id_name:"---");
+    device_info_line(st,1,"NODE",buf);
+    device_info_line(st,2,"MESH",mesh_is_ready?"ready":"starting");
+    // "off" means the SDK stack is deinitialised, the normal standalone state.
+    const MeshInkWirelessState wireless=meshink_wireless_read_state();
+    device_info_line(st,3,"WIFI",wireless.wifi_off?"off":"on");
+    device_info_line(st,4,"BLUETOOTH",
+        (wireless.bluetooth_controller_off&&wireless.bluetooth_host_off)?"off":"on");
+    if(!status_gps_enabled)snprintf(buf,sizeof(buf),"off");
+    else if(status_gps_error!=MeshInkGpsError::None)snprintf(buf,sizeof(buf),"error");
+    else if(status_gps_fix)snprintf(buf,sizeof(buf),"fix, %d sats",(int)status_gps_satellites);
+    else snprintf(buf,sizeof(buf),"searching");
+    device_info_line(st,5,"GPS",buf);
+    device_info_line(st,6,"SD CARD",meshink_storage_media_ready()?"present":"not found");
+
+
+    const MeshInkUiRect radio=meshink_outer_row_rect(layout,664,116);
+    ui_section_card(radio);
+    ui_text("LORA",layout.content_text_x,radio.y+ui_h(13),3,0,true);
+    ui_draw_wrapped(mesh_protocol_radio_summary(),layout.content_text_x,radio.y+ui_h(52),
+                    radio.width-ui_w(32),2,0,false,2);
+    }else{
+
+    const MeshInkUiRect sys=meshink_outer_row_rect(layout,110,198);
+    ui_section_card(sys);
+    ui_text("SYSTEM",layout.content_text_x,sys.y+ui_h(13),3,0,true);
+    if(mesh_is_ready&&mesh_protocol_time_valid()){
+        time_t now=(time_t)mesh_protocol_current_time();struct tm local{};localtime_r(&now,&local);
+        snprintf(buf,sizeof(buf),"%04d-%02d-%02d %02d:%02d",local.tm_year+1900,local.tm_mon+1,
+                 local.tm_mday,local.tm_hour,local.tm_min);
+    }else snprintf(buf,sizeof(buf),"not set");
+    device_info_line(sys,0,"CLOCK",buf);
+    const unsigned long up=millis()/1000UL;
+    snprintf(buf,sizeof(buf),"%lud %02lu:%02lu:%02lu",up/86400UL,(up/3600UL)%24UL,(up/60UL)%60UL,up%60UL);
+    device_info_line(sys,1,"UPTIME",buf);
+    snprintf(buf,sizeof(buf),"%lu KB",(unsigned long)(ESP.getFreeHeap()/1024UL));
+    device_info_line(sys,2,"FREE RAM",buf);
+    snprintf(buf,sizeof(buf),"%lu KB",(unsigned long)(ESP.getFreePsram()/1024UL));
+    device_info_line(sys,3,"FREE PSRAM",buf);
+
+    const MeshInkUiRect power=meshink_outer_row_rect(layout,320,164);
+    ui_section_card(power);
+    ui_text("POWER",layout.content_text_x,power.y+ui_h(13),3,0,true);
+    MeshInkPowerStatus ps{};
+    const bool ps_ok=meshink_power_read_status(ps);
+    if(ps_ok&&ps.battery_percent_valid&&ps.battery_voltage_valid)
+        snprintf(buf,sizeof(buf),"%u%% (%u mV)",(unsigned)ps.battery_percent,(unsigned)ps.battery_mv);
+    else if(ps_ok&&ps.battery_percent_valid)snprintf(buf,sizeof(buf),"%u%%",(unsigned)ps.battery_percent);
+    else if(ps_ok&&ps.battery_voltage_valid)snprintf(buf,sizeof(buf),"%u mV",(unsigned)ps.battery_mv);
+    else snprintf(buf,sizeof(buf),"---");
+    device_info_line(power,0,"BATTERY",buf);
+    device_info_line(power,1,"CHARGE",ps_ok?meshink_power_charge_state_name(ps.charge_state):"---");
+    device_info_line(power,2,"SOURCE",ps_ok?(ps.external_power?"USB / external":"battery"):"---");
+    }
+    const MeshInkUiRect prev_rect=meshink_preset_prev_rect(layout);
+    const MeshInkUiRect next_rect=meshink_preset_next_rect(layout);
+    ui_action_button("PREV",prev_rect,device_info_page==0);
+    ui_action_button("NEXT",next_rect,device_info_page+1>=pages);
+    char page_text[20];snprintf(page_text,sizeof(page_text),"PAGE %u OF %u",device_info_page+1,pages);
+    ui_centred(page_text,ui_y(890),2,0,true);
+}
+
 static void draw_screen();
 static void refresh(MeshInkRefreshMode mode,bool wake_light);
 static bool hit(int16_t x,int16_t y,int bx,int by,int bw,int bh);
@@ -4771,10 +4881,10 @@ static void draw_screen() {
         case Screen::BackupProgress:draw_backup_progress();break;
         case Screen::BackupResult:draw_backup_result();break;case Screen::GpsSettings:draw_gps_settings();break;case Screen::GpsTuning:draw_gps_tuning();break;case Screen::LocationSharing:draw_location_sharing();break;
         case Screen::DateTime:draw_date_time();break;case Screen::ManualTime:draw_manual_time();break;case Screen::Timezone:draw_timezone();break;case Screen::CustomTimezone:draw_custom_timezone();break;
-        case Screen::DisplaySettings:draw_display_settings();break;case Screen::NightSchedule:draw_night_schedule();break;case Screen::Help:draw_help();break;case Screen::About:draw_about();break;
+        case Screen::DisplaySettings:draw_display_settings();break;case Screen::NightSchedule:draw_night_schedule();break;case Screen::Help:draw_help();break;case Screen::About:draw_about();break;case Screen::DeviceInfo:draw_device_info();break;
     }
     const bool settings_page=screen==Screen::Settings||screen==Screen::BackupOptions||
-        screen==Screen::BackupFiles||screen==Screen::BackupConfirm||screen==Screen::BackupProgress||screen==Screen::BackupResult||screen==Screen::ProtocolSelect||screen==Screen::ProtocolSettings||screen==Screen::GpsSettings||screen==Screen::GpsTuning||screen==Screen::LocationSharing||screen==Screen::DateTime||screen==Screen::ManualTime||screen==Screen::Timezone||screen==Screen::CustomTimezone||screen==Screen::DisplaySettings||screen==Screen::NightSchedule||screen==Screen::Help||screen==Screen::About;
+        screen==Screen::BackupFiles||screen==Screen::BackupConfirm||screen==Screen::BackupProgress||screen==Screen::BackupResult||screen==Screen::ProtocolSelect||screen==Screen::ProtocolSettings||screen==Screen::GpsSettings||screen==Screen::GpsTuning||screen==Screen::LocationSharing||screen==Screen::DateTime||screen==Screen::ManualTime||screen==Screen::Timezone||screen==Screen::CustomTimezone||screen==Screen::DisplaySettings||screen==Screen::NightSchedule||screen==Screen::Help||screen==Screen::About||screen==Screen::DeviceInfo;
     if(screen==Screen::ContactDetails&&!(keyboard_visible&&keyboard_password_mode))draw_bottom_nav(details_from_discovery?3:0);
     else if((screen==Screen::ContactChat||screen==Screen::ChannelChat)&&
             !keyboard_visible&&chat_page==0)
@@ -6181,10 +6291,10 @@ static bool handle_app_tap(int16_t x,int16_t y) {
             }
             break;
         case Screen::More:{
-            MoreMenuItem items[6]{};
+            MoreMenuItem items[7]{};
             const size_t count=more_menu_items(items);
             for(size_t i=0;i<count;++i){
-                if(!hit_outer_row(x,y,more_row_y(i)))continue;
+                if(!hit_outer_row(x,y,more_row_y(i,count),more_row_h(count)))continue;
                 switch(items[i].action){
                     case MoreAction::Discovery:open_screen(Screen::Discovery);break;
                     case MoreAction::Backup:
@@ -6195,6 +6305,7 @@ static bool handle_app_tap(int16_t x,int16_t y) {
                     case MoreAction::Settings:open_screen(Screen::Settings);break;
                     case MoreAction::Companion:open_screen(Screen::CompanionConfirm);break;
                     case MoreAction::Diagnostics:mesh_protocol_request_diagnostics();open_screen(Screen::Diagnostics);break;
+                    case MoreAction::DeviceInfo:device_info_page=0;open_screen(Screen::DeviceInfo);break;
                     case MoreAction::Help:open_screen(Screen::Help);break;
                 }
                 return true;
@@ -6471,6 +6582,11 @@ static bool handle_app_tap(int16_t x,int16_t y) {
             if(hit_header_back(x,y)){open_screen(Screen::More);return true;}break;
         case Screen::About:
             if(hit_header_back(x,y)){open_screen(Screen::Settings);return true;}break;
+        case Screen::DeviceInfo:
+            if(hit_header_back(x,y)){open_screen(Screen::More);return true;}
+            if(hit(x,y,meshink_preset_prev_rect(portrait_layout()))&&device_info_page>0){device_info_page--;draw_screen();refresh(MeshInkRefreshMode::FastGray16);return true;}
+            if(hit(x,y,meshink_preset_next_rect(portrait_layout()))&&device_info_page+1<2){device_info_page++;draw_screen();refresh(MeshInkRefreshMode::FastGray16);return true;}
+            break;
         default:break;
     }
     return true;

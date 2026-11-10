@@ -16,10 +16,20 @@ skills, state artifacts). No feature work started yet.
 
 ## Blockers / open questions
 
-- PlatformIO not yet installed locally. Firmware builds are unverified on this machine.
+- PlatformIO works via `python3 -m platformio` (not on PATH). First build verified 2026-11-10.
 - Should this fork's web flasher / release links be repointed from `samo-nz` to `joangape`? (Not decided. Links unchanged.)
 
 ## Log
+
+### 2026-11-10 — DEVICE INFO page (first feature, "hello world")
+
+- Added `Screen::DeviceInfo` and a `DEVICE INFO` row in MORE (before HELP) in `src/ui_onboarding.cpp`.
+  Read-only cards: POWER (battery %/mV, charge, source), DEVICE (chip, eFuse-MAC serial, flash, PSRAM),
+  STATUS (core, node, mesh, GPS, SD, firmware). No new hardware access outside existing contracts.
+- MORE now has up to 7 rows, so `more_row_y/more_row_h` use a tighter pitch when count > 6.
+- Ran: check_architecture, check_ui_regressions, check_utf8_*, check_compose_utf8_wrap, test_ui_layout: all pass.
+- Built `t5-unified-cache64` OK (RAM 41.1%, flash 34.9%). `pio` is not on PATH; use `python3 -m platformio`.
+- NOT done: flashing and any on-device check.
 
 ### 2026-11-10 — LilyGO T5 hardware skill
 
