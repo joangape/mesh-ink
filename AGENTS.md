@@ -171,7 +171,9 @@ Read these at the start of any non-trivial session. Update them before you finis
 
 ## Skills and rules
 
-- Workspace skills in `.agents/skills/`: `esp32` (ESP32/ESP-IDF/PlatformIO reference),
+- Workspace skills in `.agents/skills/`: `lilygo-t5-epaper-s3-pro` (**this board's** pins, buses, power,
+  radio, display, touch, GPS, deep sleep, serial debugging; project-authored. Prefer it over the
+  generic `esp32` skill for anything board-specific), `esp32` (ESP32/ESP-IDF/PlatformIO reference),
   `systematic-debugging`, `test-driven-development`, `verification-before-completion`.
   Vendored at pinned commits. **This file and `.agents/rules/` take precedence over generic skill advice.**
   For TDD here, "tests" means the host tests in `tests/`, built with the commands above.

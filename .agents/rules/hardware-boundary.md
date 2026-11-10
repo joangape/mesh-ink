@@ -12,3 +12,4 @@ description: "Board/hardware abstraction rules: pins, buses and chip drivers onl
 - The H752-01/V2 T5 implementation is the field-tested reference. Changes to power sequencing, radio TCXO/RF-switch init (`target.cpp`), touch or display timing carry high risk and need a hardware test entry in `docs/agent/HARDWARE_TESTS.md`.
 - Don't change `partitions.csv` or `sdkconfig.cache64` without being asked. CI greps specific sdkconfig values (cache line 64B, Bluedroid, octal SPIRAM, FATFS fastseek, log levels). A partition change also breaks the `update.bin` path for existing users.
 - Hardware safety: respect ESP32-S3 strapping pins and never drive a pin whose board use is unknown.
+- Before changing board code, load the `lilygo-t5-epaper-s3-pro` skill (`.agents/skills/lilygo-t5-epaper-s3-pro/`). After any pin change, run its `scripts/pin_audit.py`.

@@ -20,10 +20,12 @@ across sessions. Plain Markdown, committed with the code. Humans can edit these 
 ## Installed skills (provenance)
 
 Installed identically in `.claude/skills/` (Claude Code) and `.agents/skills/`
-(Antigravity), vendored without modification. All MIT licensed (LICENSE copied into each skill).
+(Antigravity), Third-party skills are vendored without modification and are MIT licensed (LICENSE copied into each).
+`lilygo-t5-epaper-s3-pro` is written for this project: update it when board code changes.
 
 | Skill | Source | Commit |
 | --- | --- | --- |
+| `lilygo-t5-epaper-s3-pro` (+ `references/`, `scripts/pin_audit.py`) | **Project-authored** from MeshInk `src/board/` + [LILYGO T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S3-4.7-e-paper-PRO) `docs/pinmap.md` | LILYGO `87436b5`; checked 2026-11-10 |
 | `esp32` (+ `references/`, `scripts/`) | [ezrover/esp32-ai-agent-skill](https://github.com/ezrover/esp32-ai-agent-skill) `skills/esp32` | `124d298e4ccaa737dbf6d26bbae47722e17f3097` |
 | `systematic-debugging` | [obra/superpowers](https://github.com/obra/superpowers) `skills/systematic-debugging` | `22f0b463e7a5e579904dd6211a520321035526f7` |
 | `test-driven-development` | obra/superpowers `skills/test-driven-development` | same |

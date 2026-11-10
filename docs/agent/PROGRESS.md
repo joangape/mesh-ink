@@ -21,6 +21,18 @@ skills, state artifacts). No feature work started yet.
 
 ## Log
 
+### 2026-11-10 — LilyGO T5 hardware skill
+
+- No LilyGO- or T5-specific skill exists online (searched skills.sh, GitHub, registries).
+  Wrote `lilygo-t5-epaper-s3-pro` from `src/board/` plus LILYGO's official pinmap/schematic
+  notes. It has 6 reference files and `scripts/pin_audit.py` (passes on the repo; a
+  negative test detects planted conflicts).
+- Discrepancies found and documented (not changed): frontlight PWM 5 kHz vs LILYGO's
+  ≤1 kHz advice; stale 20 MHz pixel-clock comment in `sdkconfig.cache64` (the code uses 17 MHz);
+  LILYGO ships GT6972P touch examples, but MeshInk supports only GT911.
+- Unused board features that could become backlog items: RTC alarm interrupt (GPIO2,
+  can wake from deep sleep), side button S3 (PCA9535 IO1_2).
+
 ### 2026-11-05 — Agent configuration
 
 - Added `CLAUDE.md`, `AGENTS.md`, `.claude/rules/*`, `.agents/rules/*`, vendored skills,
