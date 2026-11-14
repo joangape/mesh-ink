@@ -373,9 +373,14 @@ enum class Screen : uint8_t {
     Channels, ChannelChat, ChannelManage, ChannelCreate, ChannelDelete,
     Maps, Discovery, More, Diagnostics,
     Settings, ProtocolSelect, ProtocolSettings, BackupOptions, BackupFiles, BackupConfirm, BackupProgress, BackupResult,
-    GpsSettings, GpsTuning, LocationSharing, DateTime, ManualTime, Timezone, CustomTimezone, DisplaySettings, NightSchedule, Help, About, DeviceInfo
+    GpsSettings, GpsTuning, LocationSharing, DateTime, ManualTime, Timezone, CustomTimezone, DisplaySettings, NightSchedule, Help, About, DeviceInfo,
+    WifiConfirm, WifiSettings, Meteo
 };
 static Screen screen = Screen::Welcome;
+static bool wifi_mode_active = false;
+static char wifi_ssid[40] = {};
+static char wifi_pass[64] = {};
+static bool wifi_edit_password = false;
 static Screen backup_return_screen=Screen::More;
 static bool backup_restore_mode=false,backup_from_setup=false,backup_restore_pending=false;
 static uint8_t backup_flags=15,backup_available=15;
@@ -778,6 +783,10 @@ static uint32_t ui_post_render_cpu_target(){
 }
 
 static bool set_cpu_target(uint32_t mhz,const char* reason){
+    // Changing the CPU/APB clock while the WiFi driver is running can hang the
+    // chip (seen right after an HTTP fetch, at the next e-paper refresh), so
+    // WiFi mode stays at the render clock.
+    if(wifi_mode_active&&mhz<UI_RENDER_CPU_MHZ)mhz=UI_RENDER_CPU_MHZ;
     const bool accepted=meshink_performance_set_cpu_mhz(mhz);const uint32_t actual=meshink_performance_cpu_mhz();
     if(!accepted||actual!=mhz)Serial.printf("[T5-ERROR] CPU target=%lu actual=%lu MHz reason=%s\n",(unsigned long)mhz,(unsigned long)actual,reason);
     return accepted&&actual==mhz;
@@ -2023,7 +2032,7 @@ static void draw_keyboard() {
     // upper boundary without moving or changing any touch target. Password
     // and message keyboards retain their own separate composition.
     if(screen==Screen::ProtocolSettings||screen==Screen::SetupName||
-       screen==Screen::SetupRadio){
+       screen==Screen::SetupRadio||screen==Screen::WifiSettings){
         const int top=max(0,metrics.number_top-metrics.row_gap);
         if(top<metrics.height){
             meshink_display_fill_rect({0,top,metrics.width,metrics.height-top},0xFF,fb);
@@ -2055,11 +2064,14 @@ static void draw_keyboard() {
     }
     key(keyboard_symbols?"ABC":(keyboard_upper?"abc":"#+="),metrics.mode_key);
     key("DEL",metrics.delete_key);
-    key(screen==Screen::ChannelCreate?"HIDE":"LAND",metrics.orientation_key);
+    key(screen==Screen::ChannelCreate||screen==Screen::WifiSettings?"HIDE":"LAND",metrics.orientation_key);
     if(screen==Screen::SetupName||screen==Screen::SetupRadio){
         key("ENTER",metrics.wide_action_key);
     }else if(screen==Screen::ChannelCreate){
         key("DONE",metrics.wide_action_key);
+    }else if(screen==Screen::WifiSettings){
+        key("SPACE",metrics.space_key);
+        key("DONE",metrics.action_key);
     }else if(keyboard_message_mode||keyboard_password_mode){
         // Space is valid for message/password entry. Match familiar phone
         // keyboards with a wide space bar and an isolated action at right.
@@ -2428,24 +2440,29 @@ static void draw_shutdown_confirm() {
 }
 
 static void draw_bottom_nav(int selected) {
-    static const char* labels[]={"CONTACTS","CHANNELS","MAPS","MORE"};
+    static const char* labels_mesh[]={"CONTACTS","CHANNELS","MAPS","MORE"};
+    static const char* labels_wifi[]={"METEO","MAPS","MORE"};
+    const bool is_wifi = wifi_mode_active;
+    const char* const* labels = is_wifi ? labels_wifi : labels_mesh;
+    const int num_tabs = is_wifi ? 3 : 4;
     const MeshInkUiLayout& layout=portrait_layout();
+    const int tab_w = is_wifi ? (layout.width / 3) : layout.tab_width;
     meshink_display_fill_rect({0,layout.bottom_nav_top,layout.width,layout.bottom_nav_height},0xFF,fb);
     meshink_display_fill_rect({0,layout.bottom_nav_top,layout.width,ui_h(2)},0,fb);
-    for(int i=0;i<4;++i){
-        const int left=i*layout.tab_width;
+    for(int i=0;i<num_tabs;++i){
+        const int left=i*tab_w;
         const MeshInkUiRect tab={left+ui_w(5),layout.bottom_nav_top+ui_h(7),
-                                 layout.tab_width-ui_w(10),layout.bottom_nav_height-ui_h(13)};
+                                 tab_w-ui_w(10),layout.bottom_nav_height-ui_h(13)};
         const bool active=i==selected;
         if(active)rounded_box(tab,max(ui_w(11),ui_h(11)),true);
         const uint8_t color=active?0xFF:0;
         const int width=ui_text_width(labels[i],2);
-        ui_text(labels[i],left+(layout.tab_width-width)/2,
+        ui_text(labels[i],left+(tab_w-width)/2,
                 layout.bottom_nav_top+ui_h(21),2,color,true);
-        const bool unread=(i==0&&status_unread)||(i==1&&status_channel_unread);
+        const bool unread=!is_wifi && ((i==0&&status_unread)||(i==1&&status_channel_unread));
         if(unread){
             const int d=ui_w(10);
-            rounded_fill(left+layout.tab_width-ui_w(18),layout.bottom_nav_top+ui_h(10),
+            rounded_fill(left+tab_w-ui_w(18),layout.bottom_nav_top+ui_h(10),
                          d,d,d/2,color);
         }
     }
@@ -2998,7 +3015,7 @@ static void draw_maps() {
         ui_section_card(warning);
         ui_centred("SD card / maps unavailable",ui_y(328),2,0,true);
     }
-    draw_bottom_nav(2);
+    draw_bottom_nav(wifi_mode_active?1:2);
 }
 
 static void message_footer_text(const UiMessage& message,char out[72]) {
@@ -3887,13 +3904,181 @@ static void draw_setup_cancel(){
     ui_action_button("YES, RETURN",ui_rect(284,660,232,75),true);
 }
 
-enum class SettingsAction:uint8_t{Protocol,ProtocolSettings,Gps,DateTime,DisplayPower,About};
+static void draw_wifi_confirm() {
+    meshink_display_set_all_white(&display);draw_status_bar();
+    const MeshInkUiLayout& layout=portrait_layout();
+    const MeshInkUiRect cancel=meshink_confirm_left_rect(layout,650);
+    const MeshInkUiRect enable=meshink_confirm_right_rect(layout,650);
+    ui_centred("ENABLE WIFI",ui_y(120),5,0,true);
+    ui_centred("SWITCH TO CONNECTED MODE",ui_y(245),3,0,true);
+    ui_centred("DEVICE WILL REBOOT",ui_y(305),3,0,true);
+    ui_centred("LORA MESH WILL BE OFF",ui_y(350),3,0,true);
+    ui_centred("WiFi allows viewing weather data",ui_y(445),3,0,false);
+    ui_centred("You can switch back anytime in Settings",ui_y(500),2,0,false);
+    ui_action_button("CANCEL",cancel,false);
+    ui_action_button("ENABLE",enable,true);
+}
+
+static void draw_wifi_settings() {
+    draw_app_header("WIFI SETTINGS",true);
+    const MeshInkUiLayout& layout=portrait_layout();
+    if(keyboard_visible){
+        char ssid_buf[48]{};
+        if(!wifi_edit_password){
+            snprintf(ssid_buf,sizeof(ssid_buf),"%s_",wifi_ssid);
+        }else{
+            snprintf(ssid_buf,sizeof(ssid_buf),"%s",wifi_ssid[0]?wifi_ssid:"NONE");
+        }
+        settings_row("NETWORK (SSID)",ssid_buf,118);
+        char pass_buf[70]{};
+        if(wifi_edit_password){
+            snprintf(pass_buf,sizeof(pass_buf),"%s_",wifi_pass);
+        }else{
+            snprintf(pass_buf,sizeof(pass_buf),"%s",wifi_pass[0]?wifi_pass:"NONE");
+        }
+        settings_row("PASSWORD",pass_buf,236);
+        draw_keyboard();
+        return;
+    }
+    settings_row("NETWORK (SSID)",wifi_ssid[0]?wifi_ssid:"TAP TO ENTER SSID",118);
+    settings_row("PASSWORD",wifi_pass[0]?wifi_pass:"TAP TO ENTER PASSWORD",236);
+
+    char status_sub[64]{};
+    MeshInkWifiStatus st=meshink_wireless_wifi_status();
+    if(st==MeshInkWifiStatus::Connected){
+        char ip[20]{};
+        meshink_wireless_wifi_get_ip(ip,sizeof(ip));
+        snprintf(status_sub,sizeof(status_sub),"Connected  IP: %s",ip[0]?ip:"-");
+    }else if(st==MeshInkWifiStatus::Connecting){
+        snprintf(status_sub,sizeof(status_sub),"Connecting to %s...",wifi_ssid[0]?wifi_ssid:"network");
+    }else if(st==MeshInkWifiStatus::Failed){
+        snprintf(status_sub,sizeof(status_sub),"Connection failed");
+    }else{
+        snprintf(status_sub,sizeof(status_sub),"Disconnected");
+    }
+    settings_info_row("STATUS",status_sub,354);
+
+    ui_action_button("CONNECT",ui_rect(24,490,layout.section_width,65),true);
+    ui_action_button("TURN OFF WIFI (RETURN TO MESH)",ui_rect(24,570,layout.section_width,65),false);
+}
+
+static void draw_meteo() {
+    draw_app_header("METEO");
+    const MeshInkUiLayout& layout=portrait_layout();
+
+    long lat=0,lon=0;bool fix=false;
+    bool has_gps=map_device_position(lat,lon,fix);
+    double dlat=52.5200,dlon=13.4050; // Berlin fallback
+    char loc_title[48]{};
+    char loc_sub[64]{};
+    if(has_gps){
+        dlat=lat/1000000.0;dlon=lon/1000000.0;
+        snprintf(loc_title,sizeof(loc_title),"LOCATION  %s",fix?"[GPS FIX]":"[SAVED GPS]");
+        snprintf(loc_sub,sizeof(loc_sub),"LAT: %.4f   LON: %.4f",dlat,dlon);
+    }else{
+        snprintf(loc_title,sizeof(loc_title),"BERLIN, GERMANY [FALLBACK]");
+        snprintf(loc_sub,sizeof(loc_sub),"LAT: 52.5200   LON: 13.4050");
+    }
+    settings_info_row(loc_title,loc_sub,118);
+
+    const auto& w=meshink_wireless_weather_data();
+    MeshInkWifiStatus wifi_st=meshink_wireless_wifi_status();
+
+    if(w.fetching){
+        const MeshInkUiRect card=meshink_outer_row_rect(layout,245,220);
+        ui_section_card(card);
+        ui_centred("UPDATING WEATHER...",card.y+ui_h(70),3,0,true);
+        ui_centred("Fetching from Open-Meteo...",card.y+ui_h(120),2,0,false);
+    }else if(w.valid){
+        const MeshInkUiRect main_card=meshink_outer_row_rect(layout,245,230);
+        ui_section_card(main_card);
+
+        const char* cond_str="CLEAR SKY";
+        int code=w.weather_code;
+        if(code==1)cond_str="MAINLY CLEAR";
+        else if(code==2)cond_str="PARTLY CLOUDY";
+        else if(code==3)cond_str="OVERCAST";
+        else if(code>=45&&code<=48)cond_str="FOG";
+        else if(code>=51&&code<=55)cond_str="DRIZZLE";
+        else if(code>=56&&code<=57)cond_str="FREEZING DRIZZLE";
+        else if(code>=61&&code<=65)cond_str="RAIN";
+        else if(code>=66&&code<=67)cond_str="FREEZING RAIN";
+        else if(code>=71&&code<=77)cond_str="SNOW";
+        else if(code>=80&&code<=82)cond_str="RAIN SHOWERS";
+        else if(code>=85&&code<=86)cond_str="SNOW SHOWERS";
+        else if(code>=95)cond_str="THUNDERSTORM";
+
+        ui_text(cond_str,layout.content_text_x,main_card.y+ui_h(18),3,0,true);
+
+        char temp_str[32]{};
+        snprintf(temp_str,sizeof(temp_str),"%.1f C",w.temperature);
+        ui_text(temp_str,layout.content_text_x,main_card.y+ui_h(55),6,0,true);
+
+        char app_str[48]{};
+        snprintf(app_str,sizeof(app_str),"Feels like %.1f C",w.apparent_temperature);
+        ui_text(app_str,layout.content_text_x,main_card.y+ui_h(170),3,0,false);
+
+        const MeshInkUiRect detail_card=meshink_outer_row_rect(layout,490,230);
+        ui_section_card(detail_card);
+
+        char maxmin[48]{};
+        snprintf(maxmin,sizeof(maxmin),"Min: %.1f C   Max: %.1f C",w.temp_min,w.temp_max);
+        ui_text("TODAY'S RANGE",layout.content_text_x,detail_card.y+ui_h(15),3,0,true);
+        ui_text(maxmin,layout.content_text_x,detail_card.y+ui_h(50),3,0,false);
+
+        char hum_str[48]{};
+        snprintf(hum_str,sizeof(hum_str),"Humidity: %d%%    Wind: %.1f km/h",w.humidity,w.wind_speed);
+        ui_text("CONDITIONS",layout.content_text_x,detail_card.y+ui_h(115),3,0,true);
+        ui_text(hum_str,layout.content_text_x,detail_card.y+ui_h(150),3,0,false);
+    }else{
+        const MeshInkUiRect card=meshink_outer_row_rect(layout,245,260);
+        ui_section_card(card);
+        if(wifi_st!=MeshInkWifiStatus::Connected){
+            ui_centred("WIFI NOT CONNECTED",card.y+ui_h(40),3,0,true);
+            ui_centred("Connect to WiFi in Settings",card.y+ui_h(90),2,0,false);
+            ui_centred("to load weather forecast.",card.y+ui_h(125),2,0,false);
+            ui_action_button("WIFI SETTINGS",ui_rect(60,card.y+ui_h(170),layout.outer_width-ui_w(96),65),true);
+        }else{
+            ui_centred("NO WEATHER DATA",card.y+ui_h(50),3,0,true);
+            if(w.error[0]){
+                ui_centred(w.error,card.y+ui_h(100),2,0,false);
+            }
+            ui_action_button("FETCH WEATHER",ui_rect(60,card.y+ui_h(170),layout.outer_width-ui_w(96),65),true);
+        }
+    }
+
+    if(w.valid&&!w.fetching){
+        ui_action_button("REFRESH WEATHER",ui_rect(24,745,layout.section_width,65),true);
+    }
+
+    draw_bottom_nav(0);
+}
+
+enum class SettingsAction:uint8_t{Protocol,ProtocolSettings,Gps,DateTime,DisplayPower,About,Wifi};
 struct SettingsMenuItem{const char* title;const char* subtitle;SettingsAction action;};
 
-static size_t settings_menu_items(SettingsMenuItem out[6]){
+static size_t settings_menu_items(SettingsMenuItem out[7]){
     size_t count=0;
     out[count++]={"PROTOCOL",mesh_protocol_name(),SettingsAction::Protocol};
     out[count++]={"PROTOCOL SETTINGS","Identity, radio and protocol features",SettingsAction::ProtocolSettings};
+    if(wifi_mode_active){
+        static char wifi_sub[64];
+        MeshInkWifiStatus st=meshink_wireless_wifi_status();
+        if(st==MeshInkWifiStatus::Connected){
+            char ip[20]{};
+            meshink_wireless_wifi_get_ip(ip,sizeof(ip));
+            snprintf(wifi_sub,sizeof(wifi_sub),"Connected / %s",ip[0]?ip:wifi_ssid);
+        }else if(st==MeshInkWifiStatus::Connecting){
+            snprintf(wifi_sub,sizeof(wifi_sub),"Connecting to %s...",wifi_ssid[0]?wifi_ssid:"network");
+        }else if(st==MeshInkWifiStatus::Failed){
+            snprintf(wifi_sub,sizeof(wifi_sub),"Connect failed / Tap to configure");
+        }else{
+            snprintf(wifi_sub,sizeof(wifi_sub),"Configured / Tap to configure");
+        }
+        out[count++]={"WIFI",wifi_sub,SettingsAction::Wifi};
+    }else{
+        out[count++]={"WIFI","Off / Tap to enable WiFi mode",SettingsAction::Wifi};
+    }
     if(meshink_board_has_gps())
         out[count++]={"LOCATION & GPS","Position, receiver and sharing",SettingsAction::Gps};
     out[count++]={"DATE & TIME","Clock, source and timezone",SettingsAction::DateTime};
@@ -3902,14 +4087,17 @@ static size_t settings_menu_items(SettingsMenuItem out[6]){
     return count;
 }
 
-static int settings_menu_y(size_t index){return 118+(int)index*120;}
+static int settings_menu_y(size_t index,size_t count){
+    return count>6?116+(int)index*108:118+(int)index*120;
+}
+static int settings_menu_h(size_t count){return count>6?100:112;}
 
 static void draw_settings() {
     draw_app_header("SETTINGS",true);
-    SettingsMenuItem items[6]{};
+    SettingsMenuItem items[7]{};
     const size_t count=settings_menu_items(items);
     for(size_t i=0;i<count;++i)
-        settings_row(items[i].title,items[i].subtitle,settings_menu_y(i));
+        settings_row(items[i].title,items[i].subtitle,settings_menu_y(i,count),settings_menu_h(count));
 }
 
 static int protocol_select_row_y(size_t index){return 150+(int)index*150;}
@@ -4882,17 +5070,18 @@ static void draw_screen() {
         case Screen::BackupResult:draw_backup_result();break;case Screen::GpsSettings:draw_gps_settings();break;case Screen::GpsTuning:draw_gps_tuning();break;case Screen::LocationSharing:draw_location_sharing();break;
         case Screen::DateTime:draw_date_time();break;case Screen::ManualTime:draw_manual_time();break;case Screen::Timezone:draw_timezone();break;case Screen::CustomTimezone:draw_custom_timezone();break;
         case Screen::DisplaySettings:draw_display_settings();break;case Screen::NightSchedule:draw_night_schedule();break;case Screen::Help:draw_help();break;case Screen::About:draw_about();break;case Screen::DeviceInfo:draw_device_info();break;
+        case Screen::Meteo:draw_meteo();break;case Screen::WifiConfirm:draw_wifi_confirm();break;case Screen::WifiSettings:draw_wifi_settings();break;
     }
     const bool settings_page=screen==Screen::Settings||screen==Screen::BackupOptions||
-        screen==Screen::BackupFiles||screen==Screen::BackupConfirm||screen==Screen::BackupProgress||screen==Screen::BackupResult||screen==Screen::ProtocolSelect||screen==Screen::ProtocolSettings||screen==Screen::GpsSettings||screen==Screen::GpsTuning||screen==Screen::LocationSharing||screen==Screen::DateTime||screen==Screen::ManualTime||screen==Screen::Timezone||screen==Screen::CustomTimezone||screen==Screen::DisplaySettings||screen==Screen::NightSchedule||screen==Screen::Help||screen==Screen::About||screen==Screen::DeviceInfo;
-    if(screen==Screen::ContactDetails&&!(keyboard_visible&&keyboard_password_mode))draw_bottom_nav(details_from_discovery?3:0);
+        screen==Screen::BackupFiles||screen==Screen::BackupConfirm||screen==Screen::BackupProgress||screen==Screen::BackupResult||screen==Screen::ProtocolSelect||screen==Screen::ProtocolSettings||screen==Screen::GpsSettings||screen==Screen::GpsTuning||screen==Screen::LocationSharing||screen==Screen::DateTime||screen==Screen::ManualTime||screen==Screen::Timezone||screen==Screen::CustomTimezone||screen==Screen::DisplaySettings||screen==Screen::NightSchedule||screen==Screen::Help||screen==Screen::About||screen==Screen::DeviceInfo||screen==Screen::WifiConfirm||(screen==Screen::WifiSettings&&!keyboard_visible);
+    if(screen==Screen::ContactDetails&&!(keyboard_visible&&keyboard_password_mode))draw_bottom_nav(details_from_discovery?(wifi_mode_active?2:3):0);
     else if((screen==Screen::ContactChat||screen==Screen::ChannelChat)&&
             !keyboard_visible&&chat_page==0)
         draw_bottom_nav(screen==Screen::ContactChat?0:1);
     else if(screen==Screen::ChannelManage)draw_bottom_nav(1);
     else if(screen==Screen::Discovery||screen==Screen::Diagnostics||
             (settings_page&&!(screen==Screen::ProtocolSettings&&keyboard_visible)))
-        draw_bottom_nav(3);
+        draw_bottom_nav(wifi_mode_active?2:3);
     draw_toast();
     // Popup must be composed after the chat/history and entry surfaces.
     // Its hitboxes were already active; previously this draw call was missing.
@@ -5005,7 +5194,7 @@ static void load_map_with_feedback(bool already_on_map,bool force_complete_first
         else
             meshink_display_set_all_white(&display);
         draw_status_bar();
-        draw_bottom_nav(2);
+        draw_bottom_nav(wifi_mode_active?1:2);
     }
     // When panning or zooming, fb still holds the visible previous map.
     // Keep that map visible under the loading toast; this avoids a jarring
@@ -5175,7 +5364,7 @@ static bool update_charge_state(bool* icon_changed=nullptr) {
 static bool update_status_hardware() {
     const int8_t old_hour=status_hour,old_minute=status_minute;
     const int16_t old_battery=status_battery;const MeshInkChargeState old_charge=status_charge_state;
-    if(mesh_is_ready&&mesh_protocol_time_valid()){time_t now=(time_t)mesh_protocol_current_time();struct tm local{};localtime_r(&now,&local);if(local.tm_hour>=0&&local.tm_hour<24){status_hour=local.tm_hour;status_minute=local.tm_min;}}
+    if((mesh_is_ready||wifi_mode_active)&&mesh_protocol_time_valid()){time_t now=(time_t)mesh_protocol_current_time();struct tm local{};localtime_r(&now,&local);if(local.tm_hour>=0&&local.tm_hour<24){status_hour=local.tm_hour;status_minute=local.tm_min;}}
     else{status_hour=-1;status_minute=-1;}
     uint8_t battery_percent=0;
     if(meshink_power_read_battery_percent(battery_percent))
@@ -5493,7 +5682,8 @@ static void open_screen(Screen next,bool preserve_map_centre=false) {
         memset(channel_form_key_hex,0,sizeof(channel_form_key_hex));
         memset(channel_form_name,0,sizeof(channel_form_name));
     }
-    keyboard_visible=next==Screen::ChannelCreate;
+    keyboard_visible=next==Screen::ChannelCreate||next==Screen::WifiSettings;
+    if(next==Screen::WifiSettings)wifi_edit_password=(wifi_ssid[0]!=0);
     keyboard_message_mode=false;keyboard_password_mode=false;
     save_remote_password=false;remote_password[0]=0;screen=next;
     if(next==Screen::Maps) {
@@ -6064,6 +6254,49 @@ static bool handle_channel_form_keyboard(int16_t x,int16_t y){
     return true;
 }
 
+static bool handle_wifi_settings_keyboard(int16_t x,int16_t y){
+    if(screen!=Screen::WifiSettings||!keyboard_visible)return false;
+    const auto metrics=keyboard_metrics(false);
+    if(y<metrics.dismiss_above)return false;
+    if(meshink_keyboard::in_row(y,metrics.mode_key.y,metrics)){
+        if(x<meshink_keyboard::mode_split(metrics)){
+            cycle_keyboard_mode();draw_screen();refresh(MeshInkRefreshMode::Direct);return true;
+        }
+        if(x>=meshink_keyboard::delete_split(metrics)){
+            char* value=wifi_edit_password?wifi_pass:wifi_ssid;
+            const size_t n=strlen(value);if(n)value[n-1]=0;
+            queue_text_refresh();return true;
+        }
+    }
+    char c=0;
+    if(keyboard_character_at(x,y,false,c)){
+        char* value=wifi_edit_password?wifi_pass:wifi_ssid;
+        const size_t max_len=wifi_edit_password?sizeof(wifi_pass):sizeof(wifi_ssid);
+        size_t n=strlen(value);
+        if(n+1<max_len){
+            value[n]=c;value[n+1]=0;
+        }
+        queue_text_refresh();return true;
+    }
+    if(meshink_keyboard::in_row(y,metrics.bottom_top,metrics)){
+        if(x<meshink_keyboard::orientation_split(metrics)){
+            keyboard_visible=false;draw_screen();refresh(MeshInkRefreshMode::Direct);return true;
+        }
+        if(x<meshink_keyboard::action_split(metrics)){
+            char* value=wifi_edit_password?wifi_pass:wifi_ssid;
+            const size_t max_len=wifi_edit_password?sizeof(wifi_pass):sizeof(wifi_ssid);
+            size_t n=strlen(value);
+            if(n+1<max_len){
+                value[n]=' ';value[n+1]=0;
+            }
+            queue_text_refresh();return true;
+        }
+        keyboard_visible=false;draw_screen();refresh(MeshInkRefreshMode::Direct);
+        return true;
+    }
+    return true;
+}
+
 static bool handle_app_tap(int16_t x,int16_t y) {
     if(screen==Screen::Welcome||screen==Screen::Presets||screen==Screen::CompanionConfirm||screen==Screen::ShutdownConfirm)return false;
     if((screen==Screen::ContactChat||screen==Screen::ChannelChat)&&hit_header_back(x,y)){keyboard_visible=false;keyboard_message_mode=false;reset_chat_paging();open_screen(screen==Screen::ChannelChat?Screen::Channels:Screen::Contacts);return true;}
@@ -6072,12 +6305,21 @@ static bool handle_app_tap(int16_t x,int16_t y) {
     if((screen==Screen::ContactChat||screen==Screen::ChannelChat)&&handle_message_keyboard(x,y))return true;
     if(screen==Screen::ProtocolSettings&&keyboard_visible&&handle_name_keyboard(x,y))return true;
     if(screen==Screen::ChannelCreate&&handle_channel_form_keyboard(x,y))return true;
+    if(screen==Screen::WifiSettings&&handle_wifi_settings_keyboard(x,y))return true;
     const bool chat_main_page=(screen==Screen::ContactChat||screen==Screen::ChannelChat)&&
                               !keyboard_visible&&chat_page==0;
     if(screen!=Screen::ChannelCreate&&screen!=Screen::ChannelDelete&&
+       !(screen==Screen::WifiSettings&&keyboard_visible)&&
        ((screen!=Screen::ContactChat&&screen!=Screen::ChannelChat)||chat_main_page)&&
        y>=portrait_layout().bottom_nav_top){
-        const int tab=min(3,max(0,(int)x/portrait_layout().tab_width));open_screen(tab==0?Screen::Contacts:tab==1?Screen::Channels:tab==2?Screen::Maps:Screen::More);return true;}
+        if(wifi_mode_active){
+            const int tab_w=portrait_layout().width/3;
+            const int tab=min(2,max(0,(int)x/tab_w));
+            open_screen(tab==0?Screen::Meteo:tab==1?Screen::Maps:Screen::More);return true;
+        }else{
+            const int tab=min(3,max(0,(int)x/portrait_layout().tab_width));open_screen(tab==0?Screen::Contacts:tab==1?Screen::Channels:tab==2?Screen::Maps:Screen::More);return true;
+        }
+    }
     switch(screen){
         case Screen::Contacts:
             if(ui_data){
@@ -6320,11 +6562,15 @@ static bool handle_app_tap(int16_t x,int16_t y) {
             }break;
         case Screen::Settings:{
             if(hit_header_back(x,y)){open_screen(Screen::More);return true;}
-            SettingsMenuItem items[6]{};
+            SettingsMenuItem items[7]{};
             const size_t count=settings_menu_items(items);
             for(size_t i=0;i<count;++i){
-                if(!hit_outer_row(x,y,settings_menu_y(i)))continue;
+                if(!hit_outer_row(x,y,settings_menu_y(i,count),settings_menu_h(count)))continue;
                 switch(items[i].action){
+                    case SettingsAction::Wifi:
+                        if(wifi_mode_active)open_screen(Screen::WifiSettings);
+                        else open_screen(Screen::WifiConfirm);
+                        break;
                     case SettingsAction::Protocol:open_screen(Screen::ProtocolSelect);break;
                     case SettingsAction::ProtocolSettings:protocol_settings_page=0;open_screen(Screen::ProtocolSettings);break;
                     case SettingsAction::Gps:open_screen(Screen::GpsSettings);break;
@@ -6333,6 +6579,102 @@ static bool handle_app_tap(int16_t x,int16_t y) {
                     case SettingsAction::About:open_screen(Screen::About);break;
                 }
                 return true;
+            }
+            break;
+        }
+        case Screen::WifiConfirm:{
+            if(hit_header_back(x,y)||hit(x,y,meshink_confirm_left_rect(portrait_layout(),650))){
+                open_screen(Screen::Settings);return true;
+            }
+            if(hit(x,y,meshink_confirm_right_rect(portrait_layout(),650))){
+                Preferences p;
+                if(p.begin("t5-ui",false)){p.putBool("wifi_mode",true);p.end();}
+                show_toast("REBOOTING TO WIFI...");
+                draw_screen();refresh(MeshInkRefreshMode::Direct);
+                delay(300);
+                ESP.restart();
+                return true;
+            }
+            break;
+        }
+        case Screen::WifiSettings:{
+            if(hit_header_back(x,y)){
+                keyboard_visible=false;
+                open_screen(Screen::Settings);
+                return true;
+            }
+            if(hit_outer_row(x,y,118)){
+                wifi_edit_password=false;
+                keyboard_visible=true;
+                keyboard_symbols=false;
+                keyboard_upper=true;
+                draw_screen();refresh(MeshInkRefreshMode::Direct);
+                return true;
+            }
+            if(hit_outer_row(x,y,236)){
+                wifi_edit_password=true;
+                keyboard_visible=true;
+                keyboard_symbols=false;
+                keyboard_upper=false;
+                draw_screen();refresh(MeshInkRefreshMode::Direct);
+                return true;
+            }
+            if(!keyboard_visible){
+                if(hit(x,y,ui_rect(24,490,portrait_layout().section_width,65))){
+                    keyboard_visible=false;
+                    Preferences p;
+                    if(p.begin("t5-ui",false)){
+                        p.putString("wifi_ssid",wifi_ssid);
+                        p.putString("wifi_pass",wifi_pass);
+                        p.end();
+                    }
+                    meshink_wireless_wifi_begin(wifi_ssid,wifi_pass);
+                    show_toast("CONNECTING TO WIFI...");
+                    draw_screen();refresh(MeshInkRefreshMode::Direct);
+                    return true;
+                }
+                if(hit(x,y,ui_rect(24,570,portrait_layout().section_width,65))){
+                    keyboard_visible=false;
+                    Preferences p;
+                    if(p.begin("t5-ui",false)){
+                        p.putBool("wifi_mode",false);
+                        p.end();
+                    }
+                    meshink_wireless_wifi_disconnect();
+                    show_toast("REBOOTING TO MESH...");
+                    draw_screen();refresh(MeshInkRefreshMode::Direct);
+                    delay(300);
+                    ESP.restart();
+                    return true;
+                }
+            }
+            break;
+        }
+        case Screen::Meteo:{
+            long lat=0,lon=0;bool fix=false;
+            double dlat=52.5200,dlon=13.4050;
+            if(map_device_position(lat,lon,fix)){
+                dlat=lat/1000000.0;dlon=lon/1000000.0;
+            }
+            const auto& w=meshink_wireless_weather_data();
+            if(w.valid&&!w.fetching){
+                if(hit(x,y,ui_rect(24,745,portrait_layout().section_width,65))){
+                    meshink_wireless_weather_request(dlat,dlon);
+                    draw_screen();refresh(MeshInkRefreshMode::Direct);
+                    return true;
+                }
+            }else if(!w.fetching){
+                MeshInkWifiStatus wifi_st=meshink_wireless_wifi_status();
+                const MeshInkUiRect card=meshink_outer_row_rect(portrait_layout(),245,260);
+                if(hit(x,y,ui_rect(60,card.y+ui_h(170),portrait_layout().outer_width-ui_w(96),65))){
+                    if(wifi_st!=MeshInkWifiStatus::Connected){
+                        open_screen(Screen::WifiSettings);
+                    }else{
+                        meshink_wireless_weather_request(dlat,dlon);
+                        draw_screen();refresh(MeshInkRefreshMode::Direct);
+                    }
+                    return true;
+                }
             }
             break;
         }
@@ -7010,6 +7352,11 @@ void ui_prepare_headless_rx_wake() {
 
 static void ui_load_persistent_state() {
     prefs.begin("t5-ui",true);
+    wifi_mode_active=prefs.getBool("wifi_mode",false);
+    String s_ssid=prefs.getString("wifi_ssid","");
+    String s_pass=prefs.getString("wifi_pass","");
+    snprintf(wifi_ssid,sizeof(wifi_ssid),"%s",s_ssid.c_str());
+    snprintf(wifi_pass,sizeof(wifi_pass),"%s",s_pass.c_str());
     String saved_name;
     selected_preset=prefs.getUChar("preset_v2",17);
     const bool legacy_setup_complete=prefs.getBool("complete",false);
@@ -7357,7 +7704,18 @@ void ui_finish_startup() {
     // splash, then show the correct initial setup or existing-user screen.
     meshink_touch_clear();
     const bool retained_deep_wake=setup_complete&&retained_wake_tab_valid;
-    if(screen==Screen::Maps){
+    if(wifi_mode_active){
+        screen=Screen::Meteo;
+        draw_screen();
+        fast_full_redraw("METEO_AFTER_BOOT",false);
+        frontlight_event();
+        long lat=0,lon=0;bool fix=false;
+        double dlat=52.5200,dlon=13.4050;
+        if(map_device_position(lat,lon,fix)){
+            dlat=lat/1000000.0;dlon=lon/1000000.0;
+        }
+        meshink_wireless_weather_request(dlat,dlon);
+    }else if(screen==Screen::Maps){
         // On retained wake the physical panel still contains the standby image.
         // Build the complete Loading frame in memory first, then force that
         // frame directly so the user never sees an intermediate blank screen.
@@ -7402,6 +7760,23 @@ void ui_finish_startup() {
 }
 
 void ui_loop() {
+    if(wifi_mode_active&&meshink_wireless_weather_take_update()){
+        // Sync the clock from the weather server's HTTP Date. Only in Auto
+        // mode: Manual is the user's explicit choice, and set_manual_time
+        // flips the mode, so restore Auto right after.
+        const uint32_t server_utc=meshink_wireless_weather_data().server_utc;
+        if(server_utc&&mesh_protocol_time_mode()==MeshInkTimeMode::Auto&&
+           !mesh_protocol_gps_time_authoritative()){
+            if(mesh_protocol_set_manual_time(server_utc)){
+                mesh_protocol_set_time_mode(MeshInkTimeMode::Auto);
+                status_bar_dirty=true;
+                Serial.printf("[T5-METEO] clock synced from HTTP Date utc=%lu\n",(unsigned long)server_utc);
+            }
+        }
+        if(screen==Screen::Meteo||screen==Screen::WifiSettings){
+            status_dirty=true;
+        }
+    }
     // Rate-limit broad Meshtastic data updates, never the actual touch
     // interactions, unread alerts, or the deliberate status-bar cadence.
     if(mesh_event_refresh_pending && !standby_active &&

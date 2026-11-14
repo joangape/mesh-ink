@@ -33,3 +33,17 @@ mark the old one `Superseded by D-###`.
 - **Decision:** New features follow the same invariants so upstream changes can still merge
   in and features stay upstreamable.
 - **Consequences:** Protocol-specific features go through capability flags in the facade.
+
+### D-003 — Boot-Mode Isolation for WiFi and Meteo Service (2026-11-12)
+
+- **Status:** accepted
+- **Context:** Meshtastic and MeshCore require large amounts of internal RAM (DRAM), hardware timers,
+  and exclusive radio usage. Running WiFi concurrently with active mesh engines risks DRAM exhaustion,
+  stack overflows, and watchdog resets.
+- **Decision:** WiFi operates as an isolated boot mode (`wifi_mode` persisted in NVS `"t5-ui"`). Switching
+  between Mesh and WiFi mode requests user confirmation and reboots the ESP32-S3. In WiFi mode, LoRa
+  and protocol core runtimes are completely skipped during startup. Open-Meteo API is fetched over plain HTTP
+  (avoiding mbedTLS stack allocation in DRAM).
+- **Consequences:** Mesh operations (LoRa, BLE companion, packet routing) do not run while in WiFi mode.
+  The bottom navigation bar transitions cleanly to 3 tabs (`METEO`, `MAPS`, `MORE`), preserving offline
+  mapping and general settings.

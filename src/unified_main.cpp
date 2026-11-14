@@ -9,6 +9,7 @@
 #include "hardware/buttons.h"
 #include "hardware/board.h"
 #include "hardware/power.h"
+#include "hardware/rtc.h"
 #include "hardware/performance.h"
 #include "hardware/ram_audit.h"
 #include "hardware/storage.h"
@@ -40,6 +41,7 @@ static bool selected_protocol_ready_for_boot(){
 }
 
 static bool companion_mode = false;
+static bool wifi_boot_mode = false;
 static bool deep_sleep_rx_mode = false;
 static bool cache64_psram_blocked = false;
 static bool backup_boot_blocked = false;
@@ -361,9 +363,14 @@ void setup() {
         return;
     }
     companion_mode = mesh_protocol_consume_companion_request();
+    Preferences ui_prefs;
+    if(ui_prefs.begin("t5-ui", true)) {
+        wifi_boot_mode = ui_prefs.getBool("wifi_mode", false);
+        ui_prefs.end();
+    }
     Serial.printf("[T5-BOOT] MeshInk %s board=%s protocol=%s mode=%s\n",
                   T5_FIRMWARE_VERSION,meshink_board_name(),mesh_protocol_name(),
-                  companion_mode?"companion":"local");
+                  companion_mode?"companion":(wifi_boot_mode?"wifi":"local"));
 #if defined(CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE)
     Serial.printf("[T5-BOOT] cache-line=%dB\n",CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE);
 #endif
@@ -388,6 +395,28 @@ void setup() {
         if(meshink_wireless_companion_radios_ready(companion_ready))
             Serial.println("[T5-INIT] wifi-bt=OK wifi=off bt=ready");
         Serial.println("[T5-INIT] companion=READY");
+    } else if (wifi_boot_mode) {
+        meshink_ram_snapshot("before-ui-setup");
+        ui_setup();
+        // WiFi mode never runs radio_init(), which is what normally starts the
+        // PCF8563 RTC; without this the status-bar clock stays at --:--.
+        meshink_rtc_begin();
+        meshink_ram_snapshot("after-ui-setup");
+
+        Preferences creds;
+        if(creds.begin("t5-ui", true)) {
+            String ssid = creds.getString("wifi_ssid", "");
+            String pass = creds.getString("wifi_pass", "");
+            creds.end();
+            if(ssid.length() > 0) {
+                meshink_wireless_wifi_begin(ssid.c_str(), pass.c_str());
+            }
+        }
+
+        map_tiles_warm_storage();
+        ui_finish_startup();
+        meshink_ram_snapshot("after-ui-finish");
+        Serial.println("[T5-INIT] wifi-mode=READY");
     } else {
         // Standalone UI never uses the ESP32-S3 2.4 GHz radios. Explicitly
         // stop/deinitialize both stacks before local startup, then enforce and
@@ -435,6 +464,11 @@ void loop() {
     if (companion_mode) {
         mesh_protocol_companion_loop();
         companion_exit_button();
+    } else if (wifi_boot_mode) {
+        service_local_terminal();
+        meshink_rtc_tick();
+        meshink_wireless_wifi_service_loop();
+        ui_loop();
     } else {
         service_local_terminal();
         if(mesh_protocol_is_running())mesh_protocol_loop();
